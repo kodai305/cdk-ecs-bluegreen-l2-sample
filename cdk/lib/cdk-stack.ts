@@ -9,7 +9,10 @@ import { DockerImageAsset, Platform } from 'aws-cdk-lib/aws-ecr-assets';
 import * as ecrdeploy from 'cdk-ecr-deployment';
 import { Construct } from 'constructs';
 
-
+const generateRandomString = (charCount = 7): string => {
+  const str = Math.random().toString(36).substring(2).slice(-charCount)
+  return str.length < charCount ? str + 'a'.repeat(charCount - str.length) : str
+};
 export class CdkStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
@@ -56,8 +59,8 @@ export class CdkStack extends cdk.Stack {
       vpc,
       description: 'Security group ELB',
       securityGroupName: 'SGELB',
-    })
-    securityGroupELB.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Allow HTTP traffic from the world');
+    });
+    securityGroupELB.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Allow HTTP traffic from the world'); // 必須？？
 
     // ECSで動作するアプリ用のセキュリティグループ
     const securityGroupAPP = new ec2.SecurityGroup(this, 'SecurityGroupAPP', {
@@ -105,6 +108,9 @@ export class CdkStack extends cdk.Stack {
       removalPolicy: RemovalPolicy.DESTROY
     });
 
+    // tag
+    const tag = generateRandomString();
+
     // ビルド to CDKデフォルトリポジトリ
     const image = new DockerImageAsset(this, 'CDKDockerImage', {
       directory: '../app',
@@ -113,7 +119,7 @@ export class CdkStack extends cdk.Stack {
     // ビルドしたイメージをコピー to マイリポジトリ(SAMPLEなのでlatestタグ)
     new ecrdeploy.ECRDeployment(this, 'DeployDockerImage', {
       src: new ecrdeploy.DockerImageName(image.imageUri),
-      dest: new ecrdeploy.DockerImageName(repo.repositoryUri + ':latest'),
+      dest: new ecrdeploy.DockerImageName(repo.repositoryUri + ':' + tag),
     });
 
     /**
@@ -155,7 +161,7 @@ export class CdkStack extends cdk.Stack {
     );    
     fargateTaskDefinition.addContainer('SampleECS', {
       containerName: 'ecs-bluegreen-l2-container',
-      image: ecs.ContainerImage.fromEcrRepository(repo, 'latest'), // タグの指定がここでできる
+      image: ecs.ContainerImage.fromEcrRepository(repo, tag), // タグの指定がここでできる
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'ecs-bluegreen-l2',
       }),
