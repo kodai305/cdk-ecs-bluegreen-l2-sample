@@ -3,6 +3,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as codedeploy from 'aws-cdk-lib/aws-codedeploy';
 import { Effect, PolicyStatement } from 'aws-cdk-lib/aws-iam';
 import { aws_elasticloadbalancingv2 as elbv2, } from 'aws-cdk-lib';
 import { DockerImageAsset, Platform } from 'aws-cdk-lib/aws-ecr-assets';
@@ -20,7 +21,7 @@ export class CdkStack extends cdk.Stack {
      * ネットワーク関連
      */
     // create a VPC
-    const vpc = new ec2.Vpc(this, 'VPC', {
+    const vpc = new ec2.Vpc(this, 'VPCBG', {
       ipAddresses: ec2.IpAddresses.cidr('192.168.0.0/16'),
       maxAzs: 3,
       subnetConfiguration: [
@@ -60,7 +61,9 @@ export class CdkStack extends cdk.Stack {
       description: 'Security group ELB',
       securityGroupName: 'SGELB',
     });
-    securityGroupELB.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Allow HTTP traffic from the world'); // 必須？？
+    // 証明書関連はドメインに依存するので省略
+    securityGroupELB.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Allow HTTP traffic from the world');
+    securityGroupELB.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(9000), 'Allow HTTP traffic from the world for Green');
 
     // ECSで動作するアプリ用のセキュリティグループ
     const securityGroupAPP = new ec2.SecurityGroup(this, 'SecurityGroupAPP', {
@@ -77,13 +80,14 @@ export class CdkStack extends cdk.Stack {
       loadBalancerName: 'sample-cdk-bg-alb',
     })
 
-    const listener = alb.addListener('Listener', {
+    // Blue リスナー
+    const blueListener = alb.addListener('BlueListener', {
       port: 80,
       open: true,
     });
 
-    // Target Group
-    const targetGroup = new elbv2.ApplicationTargetGroup(this, 'TargetGroup', {
+    // Blue Target Group
+    const blueTargetGroup = new elbv2.ApplicationTargetGroup(this, 'BlueTargetGroup', {
       vpc,
       port: 80,
       protocol: elbv2.ApplicationProtocol.HTTP,
@@ -94,9 +98,31 @@ export class CdkStack extends cdk.Stack {
         healthyHttpCodes: '200'
       },
     });
+    blueListener.addTargetGroups('BlueTargetGroup', {
+      targetGroups: [blueTargetGroup],
+    });
 
-    listener.addTargetGroups('TargetGroup', {
-      targetGroups: [targetGroup],
+    // Green リスナー
+    const greenListener = alb.addListener('GreenListener', {
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      port: 9000,
+      open: true,
+    })    
+
+    // Green Target Group
+    const greenTargetGroup = new elbv2.ApplicationTargetGroup(this, 'GreenTargetGroup', {
+      vpc,
+      port: 80,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targetType: elbv2.TargetType.IP,
+      healthCheck: {
+        path: '/',
+        interval: Duration.seconds(60),
+        healthyHttpCodes: '200'
+      },
+    });
+    greenListener.addTargetGroups('GreenTargetGroup', {
+      targetGroups: [greenTargetGroup]
     });
 
     /**
@@ -173,7 +199,7 @@ export class CdkStack extends cdk.Stack {
     });
 
     // サービス
-    // ローリングアップデート: https://speakerdeck.com/tomoki10/ideal-and-reality-when-implementing-cicd-for-ecs-on-fargate-with-aws-cdk?slide=41
+    // B/Gアップデート: https://zenn.dev/shshimamo/articles/2c04cce1dc5502
     const service = new ecs.FargateService(this, 'Service', {
       serviceName: 'ecs-bluegreen-l2-service',
       cluster,
@@ -182,11 +208,44 @@ export class CdkStack extends cdk.Stack {
       enableExecuteCommand: true,
       desiredCount: 3,
       vpcSubnets: vpc.selectSubnets({ subnetType: ec2.SubnetType.PRIVATE_ISOLATED }),
-      maxHealthyPercent: 200, // https://stackoverflow.com/questions/40731143/what-is-the-minimum-healthy-percent-and-maximum-percent-in-amazon-ecs
-      minHealthyPercent: 50,
-      deploymentController: { type: ecs.DeploymentControllerType.ECS }, 
-      circuitBreaker: { rollback: true }
+      deploymentController: { type: ecs.DeploymentControllerType.CODE_DEPLOY }, 
     });
-    service.attachToApplicationTargetGroup(targetGroup);
+    service.attachToApplicationTargetGroup(blueTargetGroup);
+
+    // CodeDeploy の ECS アプリケーションを作成
+    const ecsApplication = new codedeploy.EcsApplication(this, 'EcsBGApplication', {});
+
+    // デプロイグループ
+    const ecsDeploymentGroup = new codedeploy.EcsDeploymentGroup(this, 'EcsDeploymentGroup', {
+      blueGreenDeploymentConfig: {  // ターゲットグループやリスナー
+        blueTargetGroup: blueTargetGroup,
+        greenTargetGroup: greenTargetGroup,
+        listener: blueListener,
+        testListener: greenListener,
+        deploymentApprovalWaitTime: cdk.Duration.minutes(10), // 待ち時間
+        terminationWaitTime: cdk.Duration.minutes(10),        // 切り替え後に元のVersionを残しておく時間
+      },
+      // ロールバックの設定
+      autoRollback: {  
+          failedDeployment: true
+      },
+      service: service,  // ECSサービス
+      application: ecsApplication,  // ECSアプリケーション
+      deploymentConfig: codedeploy.EcsDeploymentConfig.ALL_AT_ONCE, // デプロイの方式
+    });
   }
 }
+
+/**
+ * sample of appspec.yaml:
+
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: "arn:aws:ecs:aws-region-id:aws-account-id:task-definition/ecs-demo-task-definition:revision-number"
+        LoadBalancerInfo:
+          ContainerName: "your-container-name"
+          ContainerPort: your-container-port
+ */
